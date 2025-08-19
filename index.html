@@ -613,3 +613,159 @@ setDefaults();
 -->
 </body>
 </html>
+<script>
+/* ===== ARD-Prognose Add-on (plug & play) ===== */
+(function(){
+  // --- Styles injizieren ---
+  const css = `
+  .ard-overlay{position:fixed; inset:0; background:rgba(5,10,20,.6); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; z-index:9999}
+  .ard-panel{width:min(920px,96vw); max-height:92vh; overflow:auto;
+    background:linear-gradient(180deg,#0b1e3a 0%, #0a1730 100%);
+    border:1px solid rgba(255,255,255,.12); border-radius:16px; box-shadow:0 20px 60px rgba(0,0,0,.45);
+    color:#eaf2ff; padding:18px 18px 14px}
+  .ard-head{display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:12px}
+  .ard-title{font-weight:800; letter-spacing:.5px; text-transform:uppercase; font-size:18px}
+  .ard-sub{opacity:.8; font-size:12px}
+  .ard-bars{display:flex; flex-direction:column; gap:10px; margin:8px 0 12px}
+  .ard-row{display:grid; grid-template-columns:220px 1fr 80px; gap:10px; align-items:center}
+  .ard-label{display:flex; align-items:center; gap:10px; font-weight:600}
+  .ard-swatch{width:16px; height:16px; border-radius:4px; border:1px solid rgba(255,255,255,.3)}
+  .ard-track{position:relative; height:28px; background:rgba(255,255,255,.08); border-radius:8px; overflow:hidden}
+  .ard-fill{position:absolute; inset:0 auto 0 0; width:0%;
+    transition:width .9s cubic-bezier(.2,.8,.2,1); will-change:width}
+  .ard-val{font-variant-numeric:tabular-nums; text-align:right; font-weight:800; color:#ffe066}
+  .ard-foot{display:flex; gap:8px; justify-content:flex-end; margin-top:6px}
+  .ard-btn{border:1px solid rgba(255,255,255,.18); background:#0d2547; color:#eaf2ff; padding:8px 12px; border-radius:10px; cursor:pointer; font-weight:700}
+  .ard-btn.secondary{background:#0e1a33}
+  .ard-close{margin-right:auto}
+  .ard-progline{height:2px; background:linear-gradient(90deg,#ffe066,#7cc6ff); opacity:.7; margin:6px 0 10px; border-radius:2px}
+  .ard-note{font-size:11px; opacity:.7; margin-top:2px}
+  `;
+  const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
+  // --- Utils ---
+  const $ = s => document.querySelector(s);
+  const $$ = s => Array.from(document.querySelectorAll(s));
+  function norm(n){ return (n||"").toString().trim().toLowerCase().replace(/\s+/g,""); }
+  function isOther(name){ const n=norm(name); return n==="andere" || n==="sonstige"; }
+  function commaDe(x){ return x.toFixed(1).replace(".", ","); }
+  function speak(text){
+    try{
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "de-DE"; u.rate = 1; u.pitch = 1;
+      window.speechSynthesis.speak(u);
+    }catch(e){}
+  }
+
+  // --- Button automatisch einfügen ---
+  function ensureButton(){
+    if ($("#showArdBtn")) return;
+    // Versuche, in der "Koalitionen testen"-Karte zu platzieren
+    const coalCard = Array.from($$(".card h3")).find(h => /Koalitionen/i.test(h.textContent))?.parentElement || document.body;
+    const bar = document.createElement("div"); bar.className="row";
+    bar.innerHTML = `<button id="showArdBtn" type="button" class="ard-btn">ARD-Prognose starten</button>
+                     <button id="showArdBtnMute" type="button" class="ard-btn secondary">Ohne Stimme</button>`;
+    coalCard.appendChild(bar);
+    $("#showArdBtn").addEventListener("click", ()=> openOverlay(true));
+    $("#showArdBtnMute").addEventListener("click", ()=> openOverlay(false));
+  }
+
+  // --- Daten sammeln (aus deiner aktuellen Eingabe) ---
+  function getCurrentPartiesSorted(){
+    // nutzt dein bestehendes readInputs(), falls vorhanden
+    let parties=[];
+    if (typeof readInputs === "function"){
+      const { parties: list } = readInputs();
+      parties = list;
+    } else {
+      // Fallback: aus UI lesen
+      const rows = $$("#partyList .party-row");
+      parties = rows.map(r=>({
+        name: (r.querySelector(".pName")?.value||"").trim(),
+        pct: parseFloat(r.querySelector(".pPct")?.value||"0")||0,
+        color: r.querySelector(".pColor")?.value || "#8888ff"
+      }));
+    }
+    // filtern + sortieren
+    return parties
+      .filter(p => p && p.name && !isOther(p.name) && (p.pct||0) > 0)
+      .sort((a,b)=> (b.pct||0) - (a.pct||0));
+  }
+
+  // --- Overlay bauen ---
+  function buildOverlay(){
+    let ov = $("#ardOverlay"); if (ov) return ov;
+    ov = document.createElement("div");
+    ov.className="ard-overlay"; ov.id="ardOverlay"; ov.style.display="none";
+    ov.innerHTML = `
+      <div class="ard-panel">
+        <div class="ard-head">
+          <div>
+            <div class="ard-title">Prognose – ARD-Stil (inoffiziell)</div>
+            <div class="ard-sub">Basis: deine aktuell eingestellten Prozentwerte</div>
+          </div>
+          <button class="ard-btn ard-close">Schließen</button>
+        </div>
+        <div class="ard-progline"></div>
+        <div class="ard-bars" id="ardBars"></div>
+        <div class="ard-foot">
+          <div class="ard-note">Hinweis: Optik angelehnt, keine Logos/Marken. Sprache: Web Speech API.</div>
+          <span style="flex:1"></span>
+          <button class="ard-btn secondary" id="ardSpeakBtn">🔊 Ansage</button>
+          <button class="ard-btn secondary" id="ardStopBtn">⏹ Stopp</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(ov);
+    ov.querySelector(".ard-close").addEventListener("click", ()=>{ window.speechSynthesis?.cancel(); ov.style.display="none"; });
+    ov.addEventListener("click", e=>{ if(e.target===ov){ window.speechSynthesis?.cancel(); ov.style.display="none"; }});
+    return ov;
+  }
+
+  // --- Bars rendern + animieren ---
+  function renderBars(list){
+    const bars = $("#ardBars"); bars.innerHTML="";
+    const SCALE = 1.6; // macht Balken „fernseh-tauglich“ groß; 25% -> 40% Breite
+    list.forEach(p=>{
+      const row = document.createElement("div"); row.className="ard-row";
+      row.innerHTML = `
+        <div class="ard-label"><span class="ard-swatch" style="background:${p.color}"></span>${p.name}</div>
+        <div class="ard-track"><div class="ard-fill" style="background:${p.color};"></div></div>
+        <div class="ard-val">${commaDe(p.pct)}%</div>
+      `;
+      bars.appendChild(row);
+      const fill = row.querySelector(".ard-fill");
+      const target = Math.min(100, (p.pct||0) * SCALE); // skaliert, aber nie >100%
+      // Start bei 0, dann animieren:
+      requestAnimationFrame(()=>{ fill.style.width = target + "%"; });
+    });
+  }
+
+  // --- Sprachtext bauen (de-DE, mit „Komma“) ---
+  function buildSpeech(list){
+    if (!list.length) return "Keine Daten für die Prognose.";
+    const parts = list.map(p => {
+      const pct = p.pct ?? 0;
+      const spoken = pct.toFixed(1).replace(".", " Komma ");
+      return `${p.name} ${spoken} Prozent`;
+    });
+    return `Prognose. ${parts.join(". ")}.`;
+  }
+
+  // --- Öffnen ---
+  function openOverlay(withVoice){
+    const data = getCurrentPartiesSorted();
+    const ov = buildOverlay();
+    renderBars(data);
+    ov.style.display="flex";
+    if(withVoice) speak(buildSpeech(data));
+    $("#ardSpeakBtn").onclick = ()=> speak(buildSpeech(getCurrentPartiesSorted()));
+    $("#ardStopBtn").onclick  = ()=> window.speechSynthesis?.cancel();
+  }
+
+  // init
+  ensureButton();
+})();
+</script>
